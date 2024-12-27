@@ -1,0 +1,1747 @@
+# Merged Python Project
+
+Below are all .py files in the project. Each file is wrapped in a code block.
+
+## File: circuit_breaker.py
+
+```python
+"""
+Circuit Breaker Pattern Implementation
+
+This module implements the Circuit Breaker design pattern, which is used to detect failures and
+encapsulates the logic of preventing a failure from constantly recurring during maintenance,
+temporary external system failure, or unexpected system difficulties.
+
+The circuit breaker has three states:
+- CLOSED: Normal operation, requests are allowed through
+- OPEN: Failure threshold exceeded, requests are blocked
+- HALF-OPEN: Testing if the system has recovered
+
+Think of it like an electrical circuit breaker in your home:
+- CLOSED: Everything works normally, electricity flows
+- OPEN: Too many problems detected, power is cut off to prevent damage
+- HALF-OPEN: Testing if it's safe to restore power
+"""
+
+import logging
+from datetime import datetime
+from dataclasses import dataclass, field
+import threading
+
+
+@dataclass
+class CircuitBreaker:
+    """
+    A circuit breaker implementation that helps prevent repeated calls to failing endpoints.
+
+    The circuit breaker monitors for failures and automatically "trips" (opens) when a threshold
+    is exceeded, preventing further calls that are likely to fail. After a timeout period,
+    it allows a test request through to check if the system has recovered.
+
+    Attributes:
+        failure_threshold (int): Number of failures before the circuit opens (default: 5)
+        recovery_timeout (int): Seconds to wait before attempting recovery (default: 60)
+        failure_count (int): Current number of consecutive failures
+        state (str): Current circuit state ("CLOSED", "OPEN", or "HALF-OPEN")
+        last_failure_time (datetime): Timestamp of the last recorded failure
+        lock (threading.Lock): Thread lock for thread-safe operations
+
+    Example:
+        breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=30)
+
+        if breaker.allow_request():
+            try:
+                # Make your API call or other operation here
+                response = make_api_call()
+                breaker.reset()  # Success! Reset the breaker
+            except Exception:
+                breaker.record_failure()  # Record the failure
+        else:
+            # Circuit is open, handle accordingly
+            logging.warning("Circuit breaker is open, skipping request")
+    """
+
+    failure_threshold: int = 5
+    recovery_timeout: int = 60
+    failure_count: int = 0
+    state: str = "CLOSED"
+    last_failure_time: datetime = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def record_failure(self) -> None:
+        """
+        Records a failure and updates the circuit breaker state.
+
+        When the number of failures reaches the threshold, the circuit
+        transitions to the OPEN state, preventing further requests.
+
+        Thread-safe method that:
+        1. Increments the failure counter
+        2. Updates the last failure timestamp
+        3. Changes state to OPEN if threshold is reached
+        """
+        with self.lock:
+            self.failure_count += 1
+            self.last_failure_time = datetime.now()
+            if self.failure_count >= self.failure_threshold:
+                self.state = "OPEN"
+                logging.warning("Circuit breaker transition to OPEN")
+
+    def allow_request(self) -> bool:
+        """
+        Determines if a request should be allowed through the circuit breaker.
+
+        Returns:
+            bool: True if the request should be allowed, False if it should be blocked
+
+        This method implements the core circuit breaker logic:
+        - If CLOSED: Always allows requests
+        - If OPEN: Blocks requests until recovery_timeout has elapsed
+        - If recovery_timeout has elapsed: Transitions to HALF-OPEN and allows one test request
+
+        Thread-safe method that ensures consistent state across multiple threads.
+        """
+        with self.lock:
+            if self.state == "OPEN":
+                # Check if enough time has passed since the last failure
+                if (
+                    self.last_failure_time
+                    and (datetime.now() - self.last_failure_time).total_seconds()
+                    > self.recovery_timeout
+                ):
+                    self.state = "HALF_OPEN"
+                    logging.warning("Circuit breaker transition to HALF_OPEN")
+                    return True
+                return False
+            return True
+
+    def reset(self) -> None:
+        """
+        Resets the circuit breaker to its initial closed state.
+
+        This method should be called when a request succeeds, particularly
+        in the HALF-OPEN state, indicating that the system has recovered.
+
+        Thread-safe method that:
+        1. Changes state back to CLOSED
+        2. Resets the failure counter to 0
+        3. Logs the successful reset
+        """
+        with self.lock:
+            self.state = "CLOSED"
+            self.failure_count = 0
+            logging.info("Circuit breaker reset to CLOSED")
+
+```
+
+## File: config.py
+
+```python
+"""
+Configuration Management Module
+
+This module defines the configuration settings for the ticket processing pipeline,
+handling everything from file paths to performance tuning parameters. It uses
+environment variables, `.env` (optional), and sensible defaults to configure the system.
+
+It also includes validation logic to ensure the configuration is in a valid state.
+"""
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+# Optional .env support for local development
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # Loads variables from a .env file if present
+except ImportError:
+    pass  # If python-dotenv isn't installed, we skip loading .env without error
+
+
+@dataclass
+class Config:
+    """
+    Primary configuration for the ticket-processing pipeline.
+
+    This class manages all configuration settings, organized into several logical groups:
+
+    1. API Configuration:
+        - api_key: OpenAI API key
+        - provider: AI provider selection ('openai' or 'azure')
+        - Azure-specific settings (when using Azure)
+
+    2. File Handling:
+        - input_file: Source of ticket data
+        - good_tickets_file: Output for successfully processed tickets
+        - bad_tickets_file: Output for failed ticket processing
+
+    3. Processing Parameters:
+        - batch_size: Number of tickets to process in one batch
+        - min_word_count: Minimum words required for valid ticket
+        - model_name: LLM model to use
+        - max_tokens: Maximum tokens per request
+        - token_margin: Safety margin for token calculations
+
+    4. Concurrency Settings:
+        - num_workers: Total worker processes
+        - initial_workers: Starting number of workers
+        - scale_step: Worker count adjustment step
+        - scale_interval: Time between scaling decisions (seconds)
+        - max_workers: Maximum allowed workers
+        - throttle_delay: Delay (seconds) between requests
+
+    5. Error Handling:
+        - error_threshold: Failures before circuit breaker trips
+        - cool_down_time: Recovery wait time after errors
+
+    6. Rate Limiting:
+        - token_bucket_capacity: Maximum burst capacity
+        - token_refill_rate: Rate of token replenishment
+
+    7. Resource Management:
+        - enable_resource_monitoring: Toggle CPU monitoring
+        - cpu_scale_up_threshold: CPU usage threshold for scaling up
+        - cpu_scale_down_threshold: CPU usage threshold for scaling down
+
+    Example:
+        config = Config()
+        # All environment-dependent settings will be loaded or use defaults
+    """
+
+    api_key: str = os.getenv("OPENAI_API_KEY", "")
+    input_file: Path = Path("cleaned_ticket_data.json")
+    good_tickets_file: Path = Path("good_tickets.jsonl")
+    bad_tickets_file: Path = Path("bad_tickets.jsonl")
+    num_workers: int = max(1, (os.cpu_count() or 1) * 2)
+    batch_size: int = 500
+    min_word_count: int = 5
+    model_name: str = "gpt-4o-2024-12-17"
+    max_tokens: int = 8192
+    token_margin: int = 50
+
+    initial_workers: int = 10
+    scale_step: int = 5
+    scale_interval: int = 30
+    max_workers: int = 50
+    throttle_delay: float = 0.2
+
+    error_threshold: int = 5
+    cool_down_time: int = 60
+
+    token_bucket_capacity: int = 100
+    token_refill_rate: int = 10
+
+    provider: str = "openai"  # or "azure"
+    azure_api_base: str = ""
+    azure_api_version: str = ""
+    azure_deployment_name: str = ""
+
+    enable_resource_monitoring: bool = True
+
+    cpu_scale_up_threshold: float = 75.0
+    cpu_scale_down_threshold: float = 90.0
+
+    def __post_init__(self) -> None:
+        """
+        Performs validation after initialization to ensure configuration consistency.
+
+        1. Worker count consistency:
+           - Ensures max_workers >= initial_workers
+           - Validates scale_step is positive
+
+        2. Azure provider requirements:
+           - If using Azure, validates all required Azure settings are provided
+           - Checks for azure_api_base, azure_api_version, azure_deployment_name
+
+        Raises:
+            ValueError: If any validation checks fail, with a descriptive error message
+        """
+        if self.max_workers < self.initial_workers:
+            raise ValueError("max_workers cannot be smaller than initial_workers.")
+        if self.scale_step <= 0:
+            raise ValueError("scale_step must be > 0.")
+        if self.provider.lower() == "azure":
+            if (
+                not self.azure_api_base
+                or not self.azure_api_version
+                or not self.azure_deployment_name
+            ):
+                raise ValueError(
+                    "Must provide Azure base, version, and deployment name if provider='azure'."
+                )
+
+```
+
+## File: io_utils.py
+
+```python
+"""
+I/O Utilities Module
+
+This module provides thread-safe file I/O operations for the ticket processing pipeline.
+It handles atomic file writes and implements a dedicated writer process for handling
+concurrent file operations safely.
+
+Key features:
+- Atomic file writing using temporary files
+- JSONL format for efficient streaming of records
+- Multiprocessing queue for thread-safe file operations
+- Graceful handling of various data types (TicketSchema, dict, str)
+- Error handling and logging for I/O operations
+"""
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, List, Tuple, Union
+from multiprocessing import Queue as MPQueue
+
+from models import TicketSchema
+
+
+def write_batch_to_file(batch: List[Any], file_path: Path) -> None:
+    """
+    Writes a batch of items to a file in JSONL (JSON Lines) format using atomic operations.
+
+    This function implements safe file writing by:
+    1. Writing to a temporary file first
+    2. Using atomic rename operation to replace the target file
+    3. Cleaning up temporary files in case of errors
+
+    Args:
+        batch: List of items to write. Each item can be:
+            - TicketSchema: Converted to dict using model_dump()
+            - dict: Written directly
+            - str: Wrapped in {"error": str} format
+        file_path: Path where the JSONL file should be written
+
+    Example:
+        tickets = [
+            TicketSchema(instruction="Reset password", ...),
+            {"custom_field": "value"},
+            "Error processing ticket"
+        ]
+        write_batch_to_file(tickets, Path("output.jsonl"))
+
+        # Creates file with content like:
+        # {"instruction": "Reset password", ...}
+        # {"custom_field": "value"}
+        # {"error": "Error processing ticket"}
+
+    Note:
+        - Empty batches are skipped
+        - Uses UTF-8 encoding for universal character support
+        - Implements atomic write operations for data safety
+        - Handles cleanup of temporary files in error cases
+    """
+    if not batch:
+        return
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            for item in batch:
+                if isinstance(item, TicketSchema):
+                    item = item.model_dump()
+                elif isinstance(item, dict):
+                    item = item
+                elif isinstance(item, str):
+                    item = {"error": item}
+                fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, file_path)  # atomic on most POSIX systems
+        logging.info("Wrote batch of %d items to %s", len(batch), file_path)
+    except OSError as exc:
+        logging.error("Error writing batch to %s: %s", file_path, exc, exc_info=True)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def writer_process(file_queue: MPQueue) -> None:
+    """
+    Dedicated process for handling file writing operations from a multiprocessing queue.
+
+    This function runs in a separate process and:
+    1. Continuously monitors a queue for write requests
+    2. Processes batches of data as they arrive
+    3. Handles graceful shutdown when receiving None
+
+    Args:
+        file_queue: Multiprocessing queue that receives tuples of (batch, path)
+                   or None for shutdown
+
+    Queue Input Format:
+        - Normal operation: Tuple[List[Any], Path] for batch writing
+        - Shutdown signal: None to stop the process
+
+    Example:
+        from multiprocessing import Process, Queue
+
+        # Create queue and start writer process
+        file_queue = Queue()
+        writer = Process(target=writer_process, args=(file_queue,))
+        writer.start()
+
+        # Send data to be written
+        batch = [{"field": "value"}]
+        file_queue.put((batch, Path("output.jsonl")))
+
+        # Shutdown writer process
+        file_queue.put(None)
+        writer.join()
+
+    Note:
+        - Thread-safe due to queue-based communication
+        - Handles one batch at a time to maintain order
+        - Implements graceful shutdown protocol
+    """
+    while True:
+        data = file_queue.get()
+        if data is None:
+            break
+        batch, path = data
+        write_batch_to_file(batch, path)
+
+```
+
+## File: llm_api.py
+
+```python
+"""
+LLM API Integration Module
+
+This module handles all interactions with the Large Language Model (LLM) API,
+specifically OpenAI's GPT models, for ticket processing. It manages:
+1. API configuration and calls
+2. Prompt engineering and response formatting
+3. Error handling and retries
+4. Response validation and parsing
+
+The module supports both OpenAI and Azure OpenAI Services, with automatic
+retry logic for rate limits and API errors.
+"""
+
+import logging
+import openai
+from openai import APIError, RateLimitError
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+from pydantic import BaseModel, ValidationError
+
+from config import Config
+from models import TicketParsedSchema
+
+# System prompt that instructs the LLM how to process tickets
+PROMPT_INSTRUCTIONS = """
+You are preparing IT service tickets for training an LLM (PHI-3).
+Each ticket has these raw fields: 'Short Description', 'Description', 'Close Notes', 'Category', 'Subcategory', 
+and 'Assignment Group'. The raw data is provided to you in JSON format. Please remember as you process these tickets 
+that you must remove peoples names, phone numbers, email addresses, badge numbers, and any other sensitive 
+information from the text using the proper tags.
+
+Your tasks:
+1. Decide if the ticket is GOOD or BAD for training:
+   - GOOD if it has a meaningful user problem & some resolution (Close Notes) or resolution somewhere in the ticket text, 
+   that would be valid for LLM Training.
+   - BAD if it's incomplete/spam/no real resolution or meaningful outcome for training a service desk LLM.
+2. If GOOD:
+   - Merge 'Short Description' + 'Description' as 'instruction' (remove PII like phone #s, disclaimers).
+   - Summarize 'Close Notes' as 'response'.
+   - Use 'Category', 'Subcategory', 'Assignment Group' as is, or 'unknown' if missing.
+3. If BAD:
+   - Return an explanation in your refusal property or a short reason.
+4. Output MUST comply with the JSON schema.
+5. If the raw text is short but valid, try to paraphrase to get at least 5 words each for 'instruction' & 'response', but do NOT make up facts.
+6. PRIORITY: You absolutely MUST remove phone numbers, replace people names with <NAME>, replace personal emails with <EMAIL_ADDRESS>, 
+badge numbers with <BADGE_NUMBER>, replace any sensitive info that slips through replace exactly with <PII>, remove disclaimers, email 
+signature blocks, and any other text that might be irrelevant or pure noise from final text. Your output must conform to the JSON schema for TicketParsedSchema
+"""
+
+
+def get_json_schema() -> dict:
+    """
+    Retrieves the JSON schema that defines the expected LLM response format.
+
+    This function uses Pydantic's schema generation to ensure the LLM's output
+    will match our TicketParsedSchema model structure.
+
+    Returns:
+        dict: JSON schema defining the required response format
+
+    Example:
+        schema = get_json_schema()
+        # Schema will include fields like:
+        # {
+        #     "type": "object",
+        #     "properties": {
+        #         "status": {"type": "string"},
+        #         "data": {...}
+        #     },
+        #     "required": ["status", "data"]
+        # }
+    """
+    return TicketParsedSchema.schema()
+
+
+def call_llm_parse(raw_ticket_str: str, config: Config):
+    """
+    Makes a direct call to the OpenAI API to process a ticket.
+
+    This function:
+    1. Configures the API client based on provider (OpenAI/Azure)
+    2. Sends the ticket data with system instructions
+    3. Requests a structured JSON response
+
+    Args:
+        raw_ticket_str: JSON string containing the raw ticket data
+        config: Configuration object with API settings
+
+    Returns:
+        OpenAI API response object
+
+    Raises:
+        Various OpenAI exceptions (handled by retry decorator)
+
+    Example:
+        config = Config(api_key="...", model_name="gpt-4")
+        ticket = '{"Short_Description": "Reset password", ...}'
+        response = call_llm_parse(ticket, config)
+    """
+    if config.provider.lower() == "azure":
+        openai.api_type = "azure"
+        openai.api_base = config.azure_api_base
+        openai.api_version = config.azure_api_version
+    else:
+        openai.api_type = "openai"
+
+    openai.api_key = config.api_key
+
+    model_or_deployment = (
+        {"deployment_id": config.azure_deployment_name}
+        if config.provider.lower() == "azure"
+        else {"model": config.model_name}
+    )
+
+    try:
+        response = openai.ChatCompletion.create(
+            **model_or_deployment,
+            messages=[
+                {"role": "system", "content": PROMPT_INSTRUCTIONS},
+                {"role": "user", "content": raw_ticket_str},
+            ],
+            max_tokens=1000,
+            temperature=0.0,
+            response_format={
+                "type": "json_schema",
+                "json_schema": get_json_schema(),
+                "strict": True,
+            },
+        )
+        return response
+    except Exception as exc:
+        logging.error("API call failed: %s", exc, exc_info=True)
+        raise exc
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=20),
+    retry=(retry_if_exception_type(RateLimitError) | retry_if_exception_type(APIError)),
+)
+def retry_call_llm_parse(raw_ticket_str: str, config: Config):
+    """
+    Wrapper around call_llm_parse that implements retry logic.
+
+    This function adds automatic retries with exponential backoff for handling
+    rate limits and temporary API failures. It will:
+    1. Retry up to 5 times
+    2. Wait between 1-20 seconds between retries (exponential backoff)
+    3. Only retry on rate limits and API errors
+
+    Args:
+        raw_ticket_str: JSON string containing the raw ticket data
+        config: Configuration object with API settings
+
+    Returns:
+        OpenAI API response object
+
+    Example:
+        config = Config(api_key="...", model_name="gpt-4")
+        ticket = '{"Short_Description": "Reset password", ...}'
+        try:
+            response = retry_call_llm_parse(ticket, config)
+        except Exception as e:
+            # Handle case where all retries failed
+            pass
+    """
+    return call_llm_parse(raw_ticket_str, config)
+
+
+def parse_response(response):
+    """
+    Parses and validates the LLM's response into a TicketParsedSchema object.
+
+    This function:
+    1. Extracts the content from the API response
+    2. Validates it against our schema
+    3. Handles any parsing or validation errors
+
+    Args:
+        response: Raw OpenAI API response object
+
+    Returns:
+        TicketParsedSchema: Validated response object, or None if parsing fails
+
+    Example:
+        response = retry_call_llm_parse(ticket, config)
+        parsed = parse_response(response)
+        if parsed:
+            if parsed.status == "good":
+                # Process successful ticket parsing
+                ticket_data = parsed.data
+            else:
+                # Handle rejected ticket
+                rejection_reason = parsed.data
+        else:
+            # Handle parsing failure
+            pass
+    """
+    try:
+        content_str = response.choices[0].message.content
+        parsed_resp = TicketParsedSchema.parse_raw(content_str)
+        return parsed_resp
+    except ValidationError as ve:
+        logging.error("Validation error in LLM response JSON: %s", ve)
+        return None
+    except Exception as exc:
+        logging.error("Unexpected error while parsing LLM response: %s", exc)
+        return None
+
+```
+
+## File: main.py
+
+```python
+"""
+Ticket Processing Application Entry Point
+
+This module serves as the main entry point for the ticket processing application.
+It handles:
+1. Command-line argument parsing
+2. Memory-efficient data loading
+3. Process management and graceful shutdown
+4. Chunk-based processing for large datasets
+
+Usage Examples:
+    # Process tickets using OpenAI
+    python main.py --input-file tickets.json --provider openai
+
+    # Process large file with custom chunk size
+    python main.py --input-file large_tickets.json --chunk-size 1000
+
+    # Process with memory limit
+    python main.py --input-file tickets.json --memory-limit-mb 2048
+
+The application supports graceful shutdown via SIGTERM/SIGINT (Ctrl+C),
+ensuring that in-progress work is completed before exit.
+"""
+
+import argparse
+import json
+import logging
+import signal
+import psutil
+from multiprocessing import Process, Queue as MPQueue
+from typing import List, Dict, Any, Generator
+
+from config import Config
+from circuit_breaker import CircuitBreaker
+from token_bucket import TokenBucket
+from io_utils import writer_process
+from pipeline import process_tickets_with_scaling
+
+# Global flag for coordinating graceful shutdown
+shutdown_requested = False
+
+
+def handle_signal(signum, frame):
+    """
+    Signal handler for graceful shutdown coordination.
+
+    This handler:
+    1. Sets global shutdown flag
+    2. Allows current processing to complete
+    3. Prevents new chunk processing
+
+    Handles:
+        - SIGTERM: Termination request
+        - SIGINT: Keyboard interrupt (Ctrl+C)
+    """
+    global shutdown_requested
+    logging.warning("Shutdown requested (signal: %s)", signum)
+    shutdown_requested = True
+
+
+def read_json_in_chunks(
+    file_path: str, chunk_size: int = 5000, memory_limit_mb: int = 4096
+) -> Generator[List[Dict[str, Any]], None, None]:
+    """
+    Memory-efficient JSON file reader that yields data in manageable chunks.
+
+    This generator function implements smart chunking that considers both:
+    1. Maximum chunk size (for processing efficiency)
+    2. Memory usage limits (to prevent OOM errors)
+
+    Args:
+        file_path: Path to JSON file containing ticket data
+        chunk_size: Maximum number of items per chunk
+        memory_limit_mb: Memory usage threshold in MB
+
+    Yields:
+        List[Dict[str, Any]]: Chunks of parsed JSON data
+    """
+    with open(file_path, "r", encoding="utf-8") as fh:
+        try:
+            data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            logging.error("Failed to decode JSON file: %s", exc)
+            return
+
+    chunk = []
+    for item in data:
+        chunk.append(item)
+        if len(chunk) >= chunk_size:
+            mem = psutil.virtual_memory()
+            if mem.used / (1024**2) > memory_limit_mb:
+                # Debug log to indicate forced yield due to memory constraints
+                logging.debug("Memory limit reached, yielding chunk early.")
+                yield chunk
+                chunk = []
+            else:
+                yield chunk
+                chunk = []
+
+    if chunk:
+        yield chunk
+
+
+def main():
+    """
+    Main application entry point and orchestrator.
+
+    This function:
+    1. Sets up logging and signal handlers
+    2. Parses command-line arguments
+    3. Initializes system components:
+       - Configuration
+       - Circuit Breaker
+       - Token Bucket
+       - File Writer Process
+    4. Manages the processing pipeline:
+       - Chunk-based file reading
+       - Ticket processing
+       - Progress tracking
+
+    Note:
+        The application can be safely interrupted with Ctrl+C,
+        which triggers a graceful shutdown sequence.
+    """
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    parser = argparse.ArgumentParser(description="Ticket Processing App")
+    parser.add_argument("--input-file", help="Path to the JSON input file of tickets")
+    parser.add_argument("--provider", help="openai or azure")
+    parser.add_argument(
+        "--chunk-size", type=int, default=5000, help="How many tickets per chunk"
+    )
+    parser.add_argument(
+        "--memory-limit-mb", type=int, default=4096, help="Memory usage threshold in MB"
+    )
+    args = parser.parse_args()
+
+    cfg = Config()
+    if args.input_file:
+        cfg.input_file = args.input_file
+    if args.provider:
+        cfg.provider = args.provider
+
+    # Extra debug message for developer awareness
+    logging.debug("Configuration loaded: %s", cfg)
+
+    breaker = CircuitBreaker(cfg.error_threshold, cfg.cool_down_time)
+    bucket = TokenBucket(cfg.token_bucket_capacity, cfg.token_refill_rate)
+
+    # A separate process for writing batches to disk
+    file_q = MPQueue()
+    writer_p = Process(target=writer_process, args=(file_q,), daemon=True)
+    writer_p.start()
+
+    total_processed = 0
+
+    for chunk_data in read_json_in_chunks(
+        file_path=str(cfg.input_file),
+        chunk_size=args.chunk_size,
+        memory_limit_mb=args.memory_limit_mb,
+    ):
+        if shutdown_requested:
+            logging.warning("Shutdown requested. Stopping further ingestion.")
+            break
+
+        # Convert each item to a JSON string
+        raw_tickets = [json.dumps(item) for item in chunk_data]
+
+        process_tickets_with_scaling(raw_tickets, cfg, file_q, breaker, bucket)
+        total_processed += len(raw_tickets)
+        logging.info(
+            "Processed a chunk of %d tickets, total processed so far: %d",
+            len(raw_tickets),
+            total_processed,
+        )
+
+    writer_p.join()
+    logging.info("All chunks processed. Total tickets processed: %d", total_processed)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+## File: models.py
+
+```python
+"""
+Data Models Module
+
+This module defines the data structures used throughout the ticket processing pipeline.
+It uses Pydantic models to ensure type safety and data validation at runtime.
+
+The module implements a progression of ticket representations:
+1. RawTicket: Initial ticket data with optional fields
+2. TicketSchema: Normalized, validated ticket data
+3. ProcessingResult: Container for processing outcomes
+4. TicketParsedSchema: LLM processing results
+
+Each model serves a specific purpose in the data transformation pipeline,
+ensuring data consistency and proper error handling.
+"""
+
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, Union, Any
+
+
+class TicketSchema(BaseModel):
+    """
+    Normalized representation of a successfully processed ticket.
+
+    This model represents the standardized format of a ticket after processing.
+    It contains all required fields with proper validation and no optional fields,
+    ensuring consistency in the processed data.
+
+    Attributes:
+        instruction (str): Clear description of what needs to be done
+        outcome (str): Description of how the ticket was resolved
+        category (str): Primary classification of the ticket
+        subcategory (str): Secondary classification for more detail
+        assignment_group (str): Team or group responsible for the ticket
+
+    Example:
+        good_ticket = TicketSchema(
+            instruction="Reset user password",
+            outcome="Password reset and communicated to user",
+            category="Account Management",
+            subcategory="Password Reset",
+            assignment_group="Help Desk"
+        )
+    """
+
+    instruction: str
+    outcome: str
+    category: str
+    subcategory: str
+    assignment_group: str
+
+
+class RawTicket(BaseModel):
+    """
+    Initial ticket data model that accepts raw input with flexible validation.
+
+    This model handles incoming ticket data which may be incomplete or inconsistent.
+    It uses optional fields with defaults to ensure we can always create a valid
+    instance, even with missing data.
+
+    Attributes:
+        Short_Description (Optional[str]): Brief ticket summary
+        Description (Optional[str]): Detailed ticket description
+        Close_Notes (Optional[str]): Notes added when closing the ticket
+        Category (Optional[str]): Primary classification (defaults to "unknown")
+        Subcategory (Optional[str]): Secondary classification (defaults to "unknown")
+        Assignment_Group (Optional[str]): Assigned team (defaults to "unknown")
+
+    Example:
+        raw_ticket = RawTicket(
+            Short_Description="User cannot log in",
+            Description="User reports being unable to access their account",
+            Category="Access Issues"
+        )
+    """
+
+    model_config = ConfigDict(extra="allow")  # Allows additional fields in raw data
+    Short_Description: Optional[str] = Field(
+        default="", description="Brief summary of the ticket"
+    )
+    Description: Optional[str] = Field(
+        default="", description="Detailed description of the issue"
+    )
+    Close_Notes: Optional[str] = Field(
+        default="", description="Notes added when resolving the ticket"
+    )
+    Category: Optional[str] = Field(
+        default="unknown", description="Primary ticket classification"
+    )
+    Subcategory: Optional[str] = Field(
+        default="unknown", description="Secondary ticket classification"
+    )
+    Assignment_Group: Optional[str] = Field(
+        default="unknown", description="Team assigned to the ticket"
+    )
+
+
+class ProcessingResult(BaseModel):
+    """
+    Container for processing results that handles both successful and failed outcomes.
+
+    This model acts as a wrapper that can contain either a successfully processed
+    ticket (TicketSchema) or an error message explaining what went wrong.
+
+    Attributes:
+        status (str): Processing status ("success" or "error")
+        data (Union[TicketSchema, str]): Either a processed ticket or error message
+
+    Example:
+        # Successful processing
+        success_result = ProcessingResult(
+            status="success",
+            data=TicketSchema(...)
+        )
+
+        # Failed processing
+        error_result = ProcessingResult(
+            status="error",
+            data="Invalid ticket format: missing required fields"
+        )
+    """
+
+    status: str = Field(..., description="Processing outcome status")
+    data: Union[TicketSchema, str] = Field(
+        ..., description="Processed ticket or error message"
+    )
+
+
+class TicketParsedSchema(BaseModel):
+    """
+    Schema for the Large Language Model (LLM) processing output.
+
+    This model represents the structured output from the LLM processing step.
+    It includes a status indicating whether the ticket was successfully parsed
+    and the resulting data (either a structured ticket or rejection reason).
+
+    Attributes:
+        status (str): LLM processing status ("good" or "bad")
+        data (Any): Flexible field that contains either:
+            - A dictionary matching TicketSchema for "good" status
+            - A string explaining rejection reason for "bad" status
+
+    Example:
+        # Successful LLM parsing
+        good_parse = TicketParsedSchema(
+            status="good",
+            data={
+                "instruction": "Reset user password",
+                "outcome": "Password reset completed",
+                "category": "Account Management",
+                "subcategory": "Password Reset",
+                "assignment_group": "Help Desk"
+            }
+        )
+
+        # Failed LLM parsing
+        bad_parse = TicketParsedSchema(
+            status="bad",
+            data="Ticket description too vague to determine clear action items"
+        )
+    """
+
+    status: str = Field(..., description="LLM processing outcome ('good' or 'bad')")
+    data: Any = Field(..., description="Parsed ticket data or rejection reason")
+
+```
+
+## File: pipeline.py
+
+```python
+"""
+Ticket Processing Pipeline Module
+
+This module implements a sophisticated concurrent processing pipeline for IT service tickets
+with the following key features:
+
+1. Adaptive Concurrency (with CPU-based scaling + random jitter)
+2. Safety Mechanisms:
+   - Circuit Breaker
+   - Token Bucket
+   - Error State Tracking
+3. Data Flow:
+   Raw Tickets → PII Redaction → LLM Processing → Validation → Output Files
+4. Performance Features:
+   - Batch Processing
+   - Thread Pool
+   - Graceful Shutdown
+
+The pipeline is designed to handle large volumes of tickets while maintaining
+system stability and respecting API rate limits.
+"""
+
+import json
+import logging
+import re
+import time
+import random  # NEW: For jitter in scaling intervals
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Empty
+from multiprocessing import Queue as MPQueue
+import psutil
+from typing import Tuple, Optional, List
+
+import threading
+
+from config import Config
+from models import TicketSchema, TicketParsedSchema
+from llm_api import retry_call_llm_parse, parse_response
+from utils import redact_pii, fill_missing_fields
+from circuit_breaker import CircuitBreaker
+from token_bucket import TokenBucket
+from io_utils import writer_process
+from shared_state import error_state, good_tickets_queue, bad_tickets_queue
+from openai import APIError, RateLimitError
+
+from main import shutdown_requested
+
+
+def _process_ticket(
+    ticket_json: str,
+    index: int,
+    cfg: Config,
+    bucket: TokenBucket,
+    circuit_breaker: CircuitBreaker,
+) -> Tuple[Optional[TicketSchema], Optional[str]]:
+    """
+    Processes a single ticket through the complete transformation pipeline.
+
+    1. JSON Parsing
+    2. Field Normalization
+    3. PII Redaction
+    4. Rate Limiting (Token Bucket)
+    5. Circuit Breaking
+    6. LLM Processing
+    7. Validation
+
+    Args:
+        ticket_json: Raw ticket data as JSON string
+        index: Worker thread identifier
+        cfg: System configuration
+        bucket: Rate limiting token bucket
+        circuit_breaker: Circuit breaker for failure protection
+
+    Returns:
+        (TicketSchema, None) for successful processing
+        (None, error_message) for failed processing
+    """
+    # Additional debug log for incoming ticket
+    logging.debug("Worker %d received ticket: %s", index, ticket_json[:200])
+
+    try:
+        data = json.loads(ticket_json)
+    except json.JSONDecodeError as exc:
+        return None, f"Invalid JSON: {exc}"
+
+    filled = fill_missing_fields(data)
+    redacted = redact_pii(filled)
+
+    # Consume a token from the token bucket
+    while not bucket.consume(1):
+        time.sleep(1)
+
+    if not circuit_breaker.allow_request():
+        return None, "Circuit breaker open (requests not allowed)"
+
+    raw_str = json.dumps(redacted)
+    try:
+        response = retry_call_llm_parse(raw_str, cfg)
+        parsed_resp = parse_response(response)
+        if not parsed_resp:
+            return None, "Failed to parse LLM response"
+    except (RateLimitError, APIError) as exc:
+        circuit_breaker.record_failure()
+        error_state.increment()
+        return None, f"API Error (final): {exc}"
+    except Exception as exc:
+        circuit_breaker.record_failure()
+        error_state.increment()
+        return None, f"Worker {index} unexpected final fail: {exc}"
+
+    if parsed_resp.status.lower() == "bad":
+        return None, parsed_resp.data
+
+    if not isinstance(parsed_resp.data, dict):
+        return None, "No parsed data in response"
+
+    try:
+        ticket = TicketSchema(**parsed_resp.data)
+    except Exception:
+        return None, "TicketSchema validation error"
+
+    # Check minimal word counts
+    instr_words = re.findall(r"\b\w+\b", ticket.instruction or "")
+    outcome_words = re.findall(r"\b\w+\b", ticket.outcome or "")
+    if len(instr_words) < cfg.min_word_count or len(outcome_words) < cfg.min_word_count:
+        return None, "Instruction or outcome too short"
+
+    return ticket, None
+
+
+def worker(
+    task_q: Queue,
+    cfg: Config,
+    index: int,
+    bucket: TokenBucket,
+    circuit_breaker: CircuitBreaker,
+    concurrency_sema: threading.Semaphore,
+) -> None:
+    """
+    Worker thread function that processes tickets from a shared queue.
+
+    1. Acquires concurrency permit
+    2. Fetches ticket from queue
+    3. Processes ticket
+    4. Routes result to good or bad queue
+    5. Releases concurrency permit
+
+    Thread Safety:
+    - Uses semaphore for concurrency control
+    - Queue for thread-safe task distribution
+    - Thread-safe result queues for output
+
+    Args:
+        task_q: Queue containing tickets to process
+        cfg: System configuration
+        index: Worker identifier
+        bucket: Rate limiting token bucket
+        circuit_breaker: Circuit breaker for failure protection
+        concurrency_sema: Semaphore for controlling active workers
+
+    Returns:
+        None. Results are pushed into good_tickets_queue or bad_tickets_queue.
+    """
+    logging.info("Worker %d started.", index)
+    while True:
+        concurrency_sema.acquire()
+        try:
+            try:
+                ticket_data = task_q.get(timeout=1)
+            except Empty:
+                break
+            if ticket_data is None:
+                task_q.task_done()
+                break
+
+            result, err = _process_ticket(
+                ticket_data, index, cfg, bucket, circuit_breaker
+            )
+            if result:
+                good_tickets_queue.put(result)
+            elif err:
+                bad_tickets_queue.put(err)
+            task_q.task_done()
+        finally:
+            concurrency_sema.release()
+
+
+def maybe_warmup(
+    num_tickets: int, cfg: Config, concurrency_sema: threading.Semaphore
+) -> None:
+    """
+    Implements adaptive warm-up strategy based on workload size.
+
+    Warm-up Strategies:
+    1. Simple Warm-up (< 10,000 tickets): sets concurrency to cfg.initial_workers
+    2. Advanced Warm-up (>= 10,000 tickets):
+       - Start with 2 workers
+       - Gradually ramp to cfg.initial_workers over ~120s
+
+    Args:
+        num_tickets: Total number of tickets to process
+        cfg: System configuration
+        concurrency_sema: Semaphore controlling worker count
+    """
+    if num_tickets < 10000:
+        needed = cfg.initial_workers - concurrency_sema._value
+        if needed > 0:
+            concurrency_sema.release(needed)
+        logging.info("Simple warmup set concurrency to %d", cfg.initial_workers)
+    else:
+        current = concurrency_sema._value
+        if current > 2:
+            for _ in range(current - 2):
+                concurrency_sema.acquire()
+        else:
+            concurrency_sema.release(max(0, 2 - current))
+
+        steps = cfg.initial_workers - 2
+        if steps > 0:
+            interval = 120 / steps
+            logging.info("Advanced warmup from 2 to %d over ~120s", cfg.initial_workers)
+            for _ in range(steps):
+                time.sleep(interval)
+                concurrency_sema.release(1)
+
+
+def process_tickets_with_scaling(
+    tickets: List[str],
+    cfg: Config,
+    file_q: MPQueue,
+    circuit_breaker: CircuitBreaker,
+    bucket: TokenBucket,
+) -> None:
+    """
+    Main orchestrator for the ticket processing pipeline with adaptive scaling and random jitter.
+
+    System Architecture:
+        Input Queue → Workers → Result Queue → File Writer
+                       |          |
+                (Rate Limit) (Circuit Breaker)
+
+    Features:
+    1. Concurrency Management with CPU-based scaling + random jitter
+    2. Safety Mechanisms (circuit breaker, token bucket, error tracking)
+    3. I/O Efficiency (batch processing of results)
+    4. Monitoring (progress bar, logging)
+
+    Args:
+        tickets: List of raw ticket JSON strings
+        cfg: System configuration
+        file_q: Queue for file writing operations
+        circuit_breaker: Circuit breaker for failure protection
+        bucket: Token bucket for rate limiting
+    """
+    logging.info("Starting ticket processing with adaptive concurrency.")
+    task_q = Queue()
+    for tk in tickets:
+        task_q.put(tk)
+
+    executor = ThreadPoolExecutor(max_workers=cfg.max_workers)
+    concurrency_sema = threading.Semaphore(1)  # Start small, ramp up in warmup
+
+    for i in range(cfg.max_workers):
+        executor.submit(
+            worker, task_q, cfg, i, bucket, circuit_breaker, concurrency_sema
+        )
+
+    total = len(tickets)
+    processed_count = 0
+
+    # Initial warmup
+    maybe_warmup(total, cfg, concurrency_sema)
+
+    from tqdm import tqdm
+
+    pbar = tqdm(total=total, desc="Processing Tickets")
+
+    last_scale_time = time.monotonic()
+    cooldown_active = False
+    current_workers = cfg.initial_workers
+
+    # Ensure concurrency matches initial_workers after warmup
+    delta = concurrency_sema._value - current_workers
+    if delta > 0:
+        for _ in range(delta):
+            concurrency_sema.acquire()
+    elif delta < 0:
+        concurrency_sema.release(-delta)
+
+    last_log_time = time.monotonic()
+
+    up_threshold = cfg.cpu_scale_up_threshold
+    down_threshold = cfg.cpu_scale_down_threshold
+
+    while True:
+        if shutdown_requested:
+            logging.warning("Graceful shutdown triggered.")
+            break
+
+        # Drain good tickets
+        if good_tickets_queue.qsize() >= cfg.batch_size:
+            batch = []
+            while not good_tickets_queue.empty() and len(batch) < cfg.batch_size:
+                batch.append(good_tickets_queue.get())
+            file_q.put((batch, cfg.good_tickets_file))
+            processed_count += len(batch)
+            pbar.update(len(batch))
+
+        # Drain bad tickets
+        if bad_tickets_queue.qsize() >= cfg.batch_size:
+            batch = []
+            while not bad_tickets_queue.empty() and len(batch) < cfg.batch_size:
+                batch.append(bad_tickets_queue.get())
+            file_q.put((batch, cfg.bad_tickets_file))
+            processed_count += len(batch)
+            pbar.update(len(batch))
+
+        # Check error threshold => cooldown
+        if error_state.error_count >= cfg.error_threshold and not cooldown_active:
+            cooldown_active = True
+            logging.warning("Too many errors. Cooling down to 1 worker.")
+            if current_workers > 1:
+                for _ in range(current_workers - 1):
+                    concurrency_sema.acquire()
+                current_workers = 1
+
+            error_state.reset()
+            time.sleep(cfg.cool_down_time)
+            circuit_breaker.reset()
+            cooldown_active = False
+
+            concurrency_sema.release(cfg.initial_workers - current_workers)
+            current_workers = cfg.initial_workers
+            last_scale_time = time.monotonic()
+
+        # Periodic adaptive scaling with hysteresis + random jitter
+        now = time.monotonic()
+        if not cooldown_active and (now - last_scale_time) >= cfg.scale_interval:
+            cpu_usage = psutil.cpu_percent() if cfg.enable_resource_monitoring else 0
+
+            # Introduce a small random jitter (0 - 5 seconds) to avoid thrashing
+            time.sleep(random.uniform(0, 5))
+
+            if cpu_usage < up_threshold and current_workers < cfg.max_workers:
+                new_count = min(current_workers + cfg.scale_step, cfg.max_workers)
+                concurrency_sema.release(new_count - current_workers)
+                logging.info(
+                    "Scaling up from %d to %d (cpu=%.1f%%)",
+                    current_workers,
+                    new_count,
+                    cpu_usage,
+                )
+                current_workers = new_count
+            elif cpu_usage > down_threshold and current_workers > 2:
+                to_reduce = min(cfg.scale_step, current_workers - 2)
+                for _ in range(to_reduce):
+                    concurrency_sema.acquire()
+                new_count = current_workers - to_reduce
+                logging.info(
+                    "Scaling down from %d to %d (cpu=%.1f%%)",
+                    current_workers,
+                    new_count,
+                    cpu_usage,
+                )
+                current_workers = new_count
+
+            last_scale_time = time.monotonic()
+
+        # Periodically log progress
+        if (time.monotonic() - last_log_time) > 30:
+            logging.info(
+                "Progress: %d/%d processed. Current concurrency=%d",
+                processed_count,
+                total,
+                current_workers,
+            )
+            last_log_time = time.monotonic()
+
+        # Check if queue is empty and no tasks remain
+        if task_q.empty():
+            # Attempt final flush
+            if good_tickets_queue.qsize() == 0 and bad_tickets_queue.qsize() == 0:
+                time.sleep(1)
+                if (
+                    task_q.empty()
+                    and good_tickets_queue.empty()
+                    and bad_tickets_queue.empty()
+                ):
+                    break
+
+        time.sleep(0.2)
+
+    pbar.close()
+    executor.shutdown(wait=True)
+
+    # Final flush
+    final_good = []
+    while not good_tickets_queue.empty():
+        final_good.append(good_tickets_queue.get())
+    if final_good:
+        file_q.put((final_good, cfg.good_tickets_file))
+
+    final_bad = []
+    while not bad_tickets_queue.empty():
+        final_bad.append(bad_tickets_queue.get())
+    if final_bad:
+        file_q.put((final_bad, cfg.bad_tickets_file))
+
+    file_q.put(None)  # Signal writer to stop
+
+```
+
+## File: shared_state.py
+
+```python
+"""
+Shared State Management Module
+
+This module manages shared state across multiple processes and threads in the ticket
+processing pipeline. It provides thread-safe counters and queues for:
+1. Error tracking and cooldown management
+2. Ticket processing results routing
+
+The shared state pattern is crucial for maintaining consistency in a concurrent
+processing environment, ensuring that all workers have access to the same
+state information without race conditions.
+"""
+
+import threading
+from dataclasses import dataclass, field
+from queue import Queue
+
+
+@dataclass
+class ErrorState:
+    """
+    Thread-safe error counter for managing cooldown periods in the processing pipeline.
+
+    This class tracks the number of errors that have occurred during ticket processing,
+    helping to implement cooldown logic when too many errors occur. It uses a lock to
+    ensure thread-safe operations in a concurrent environment.
+
+    Attributes:
+        error_count (int): Number of errors that have occurred
+        lock (threading.Lock): Thread lock for safe concurrent access
+
+    Example:
+        error_tracker = ErrorState()
+
+        # When an error occurs
+        error_tracker.increment()
+
+        # After successful recovery
+        error_tracker.reset()
+
+        # Check current error count (thread-safe)
+        with error_tracker.lock:
+            current_errors = error_tracker.error_count
+    """
+
+    error_count: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def increment(self) -> None:
+        """
+        Safely increments the error counter by 1.
+
+        This method is thread-safe and should be called whenever an error
+        occurs during ticket processing. The lock ensures that concurrent
+        increments don't result in lost updates.
+        """
+        with self.lock:
+            self.error_count += 1
+
+    def reset(self) -> None:
+        """
+        Safely resets the error counter to 0.
+
+        This method is thread-safe and should be called when the system
+        has recovered from errors and normal operation can resume.
+        """
+        with self.lock:
+            self.error_count = 0
+
+
+# Global shared state instances
+error_state = ErrorState()  # Tracks error state across all workers
+
+# Thread-safe queues for routing processed tickets
+good_tickets_queue = Queue()  # Successfully processed tickets
+bad_tickets_queue = Queue()  # Failed or invalid tickets
+
+```
+
+## File: token_bucket.py
+
+```python
+"""
+Token Bucket Rate Limiting Implementation
+
+This module implements the Token Bucket algorithm, a widely used rate limiting mechanism
+that allows for controlled bursts of activity while maintaining a long-term rate limit.
+
+Think of it like a bucket that:
+- Has a maximum capacity (e.g., 100 tokens)
+- Continuously fills at a steady rate (e.g., 10 tokens per second)
+- Each operation consumes one or more tokens
+- If the bucket is empty, operations must wait
+
+Visual representation:
+    ┌──────────────┐
+    │  Tokens (○)  │  ← Tokens refill at refill_rate
+    │    ○○○○○    │
+    │    ○○○○     │  ← Tokens are consumed by operations
+    └──────────────┘
+
+This helps prevent overwhelming external services while still allowing
+short bursts of higher activity when the bucket is full.
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime
+import threading
+
+
+@dataclass
+class TokenBucket:
+    """
+    A thread-safe implementation of the Token Bucket rate limiting algorithm.
+
+    The token bucket allows for rate limiting with controlled bursts. It's particularly
+    useful for API calls where you want to maintain a steady average rate while still
+    allowing occasional bursts of activity.
+
+    Attributes:
+        capacity (int): Maximum number of tokens the bucket can hold
+        refill_rate (int): Number of tokens added per second
+        tokens (float): Current number of tokens in the bucket
+        last_refill (datetime): Timestamp of the last token refill
+        lock (threading.Lock): Thread lock for thread-safe operations
+
+    Example:
+        # Create a bucket that allows 100 requests with 10 new tokens per second
+        bucket = TokenBucket(capacity=100, refill_rate=10)
+
+        # Try to make a request
+        if bucket.consume():
+            # Make your API call here
+            make_api_call()
+        else:
+            # Rate limit exceeded, handle accordingly
+            handle_rate_limit()
+    """
+
+    capacity: int
+    refill_rate: int
+    tokens: float = field(init=False)
+    last_refill: datetime = field(init=False)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self):
+        """
+        Initializes the token bucket after instance creation.
+
+        Sets up the initial state:
+        1. Fills the bucket to capacity with tokens
+        2. Sets the initial refill timestamp
+        """
+        self.tokens = self.capacity
+        self.last_refill = datetime.now()
+
+    def _refill(self) -> None:
+        """
+        Internal method to refill tokens based on elapsed time.
+
+        This method:
+        1. Calculates time elapsed since last refill
+        2. Adds new tokens based on refill_rate * elapsed_time
+        3. Ensures token count doesn't exceed capacity
+        4. Updates the last refill timestamp
+
+        The refill is time-based, so if 0.5 seconds have passed with a
+        refill_rate of 10/sec, 5 tokens would be added.
+        """
+        now = datetime.now()
+        elapsed = (now - self.last_refill).total_seconds()
+        added = elapsed * self.refill_rate
+        with self.lock:
+            if self.tokens < self.capacity:
+                self.tokens = min(self.capacity, self.tokens + added)
+            self.last_refill = now
+
+    def consume(self, tokens: int = 1) -> bool:
+        """
+        Attempts to consume tokens from the bucket.
+
+        Args:
+            tokens (int): Number of tokens to consume (default: 1)
+
+        Returns:
+            bool: True if tokens were consumed, False if insufficient tokens
+
+        Example:
+            # Consume 5 tokens for a more expensive operation
+            if bucket.consume(tokens=5):
+                # Perform expensive operation
+                perform_expensive_operation()
+            else:
+                # Handle rate limit, maybe wait and retry
+                wait_and_retry()
+        """
+        self._refill()
+        with self.lock:
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return True
+            return False
+
+```
+
+## File: utils.py
+
+```python
+"""
+Utility Functions Module
+
+This module provides utility functions for data processing and PII (Personally
+Identifiable Information) redaction in the ticket processing pipeline. It uses
+regular expressions for pattern matching and spaCy for named entity recognition
+to identify and redact sensitive information.
+
+Key features:
+- PII redaction (phone numbers, emails, SSNs, etc.) with centralized regex patterns
+- Named entity recognition for identifying person names
+- Data validation and field normalization
+"""
+
+import re
+import spacy
+from typing import Any, Dict, Union
+from models import RawTicket
+
+# Load the English language model for spaCy
+nlp = spacy.load("en_core_web_sm")
+
+# Centralized list of PII-related regex patterns
+# New approach: consolidated global patterns for maintainability
+PII_PATTERNS = [
+    # North American phone numbers
+    (r"\+?1?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", "<PHONE_NUMBER>"),
+    # Local phone number format
+    (r"\b\d{3}[-.\s]\d{4}\b", "<PHONE_NUMBER>"),
+    # Email addresses
+    (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "<EMAIL_ADDRESS>"),
+    # Social Security Numbers
+    (r"\b\d{3}-\d{2}-\d{4}\b", "<SSN>"),
+    # Credit card numbers (simple 16-digit)
+    (r"\b\d{16}\b", "<CARD_NUMBER>"),
+    # IP addresses
+    (r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "<IP_ADDRESS>"),
+    # Badge numbers (APD, AFD, etc.)
+    (r"\b[Aa][PpDd][Dd]?\d+\b", "<BADGE_NUMBER>"),
+    # Simple street addresses
+    (r"\b\d{1,5}\s\w+\s\w+", "<ADDRESS>"),
+    # Incident IDs
+    (r"\bINC\d+\b", "<INCIDENT_ID>"),
+]
+
+
+def redact_pii(
+    content: Union[str, Dict[str, Any], None]
+) -> Union[str, Dict[str, Any], None]:
+    """
+    Redacts Personally Identifiable Information (PII) from text or dictionary content.
+
+    This function identifies and replaces sensitive information with placeholder tags.
+    It handles both string and dictionary inputs, recursively processing dictionary
+    values. For strings, it uses both our consolidated regex patterns and spaCy’s
+    named entity recognition to identify PII.
+
+    Args:
+        content: Input text or dictionary to redact.
+            - str: Text containing potential PII
+            - Dict[str, Any]: Dictionary with values to redact
+            - None: Returns None unchanged
+
+    Returns:
+        Redacted version of the input with PII replaced by placeholder tags
+
+    Example:
+        # Redacting a string
+        text = "Please contact John Doe at john.doe@email.com"
+        redacted = redact_pii(text)
+        # "Please contact <NAME> at <EMAIL_ADDRESS>"
+    """
+    if content is None:
+        return content
+
+    if isinstance(content, dict):
+        return {k: redact_pii(v) for k, v in content.items()}
+
+    if not isinstance(content, str):
+        return content
+
+    text = content
+    for pattern, replacement in PII_PATTERNS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    # Use spaCy for named entity recognition of PERSON
+    doc = nlp(text)
+    redacted = text
+    for ent in reversed(doc.ents):
+        if ent.label_ == "PERSON":
+            start, end = ent.start_char, ent.end_char
+            redacted = f"{redacted[:start]}<NAME>{redacted[end:]}"
+
+    return redacted
+
+
+def fill_missing_fields(ticket: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validates and normalizes ticket data by ensuring all required fields are present.
+
+    This function takes a raw ticket dictionary and ensures it has all required
+    fields with proper default values. It uses the RawTicket model for validation
+    and field normalization.
+
+    Args:
+        ticket: Dictionary containing raw ticket data, potentially missing fields
+
+    Returns:
+        Dictionary with all required fields, using empty strings or "unknown" for
+        missing values
+    """
+    validated = RawTicket(**ticket)
+    return {
+        "Short_Description": validated.Short_Description or "",
+        "Description": validated.Description or "",
+        "Close_Notes": validated.Close_Notes or "",
+        "Category": (
+            validated.Category if isinstance(validated.Category, str) else "unknown"
+        ),
+        "Subcategory": (
+            validated.Subcategory
+            if isinstance(validated.Subcategory, str)
+            else "unknown"
+        ),
+        "Assignment_Group": validated.Assignment_Group or "unknown",
+    }
+
+```
+
