@@ -1,14 +1,11 @@
 """
-Shared State Management Module
+Shared State Management Module (Updated)
 
-This module manages shared state across multiple processes and threads in the ticket
-processing pipeline. It provides thread-safe counters and queues for:
-1. Error tracking and cooldown management
-2. Ticket processing results routing
+Previously, we used a boolean _pause_requested with a threading.Lock. 
+Now we use a threading.Event (pause_event) for more efficient synchronization.
 
-The shared state pattern is crucial for maintaining consistency in a concurrent
-processing environment, ensuring that all workers have access to the same
-state information without race conditions.
+Still maintains global queues for good/bad tickets, error counts, and 
+shutdown signals.
 """
 
 import threading
@@ -20,50 +17,15 @@ from queue import Queue
 class ErrorState:
     """
     Thread-safe error counter for managing cooldown periods in the processing pipeline.
-
-    This class tracks the number of errors that have occurred during ticket processing,
-    helping to implement cooldown logic when too many errors occur. It uses a lock to
-    ensure thread-safe operations in a concurrent environment.
-
-    Attributes:
-        error_count (int): Number of errors that have occurred
-        lock (threading.Lock): Thread lock for safe concurrent access
-
-    Example:
-        error_tracker = ErrorState()
-
-        # When an error occurs
-        error_tracker.increment()
-
-        # After successful recovery
-        error_tracker.reset()
-
-        # Check current error count (thread-safe)
-        with error_tracker.lock:
-            current_errors = error_tracker.error_count
     """
-
     error_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def increment(self) -> None:
-        """
-        Safely increments the error counter by 1.
-
-        This method is thread-safe and should be called whenever an error
-        occurs during ticket processing. The lock ensures that concurrent
-        increments don't result in lost updates.
-        """
         with self.lock:
             self.error_count += 1
 
     def reset(self) -> None:
-        """
-        Safely resets the error counter to 0.
-
-        This method is thread-safe and should be called when the system
-        has recovered from errors and normal operation can resume.
-        """
         with self.lock:
             self.error_count = 0
 
@@ -73,4 +35,45 @@ error_state = ErrorState()  # Tracks error state across all workers
 
 # Thread-safe queues for routing processed tickets
 good_tickets_queue = Queue()  # Successfully processed tickets
-bad_tickets_queue = Queue()  # Failed or invalid tickets
+bad_tickets_queue = Queue()   # Failed or invalid tickets
+
+# Global shutdown flag
+_shutdown_requested = False
+_shutdown_lock = threading.Lock()
+
+def is_shutdown_requested() -> bool:
+    """
+    Returns True if a shutdown has been requested.
+    Used by workers to exit gracefully.
+    """
+    with _shutdown_lock:
+        return _shutdown_requested
+
+def request_shutdown() -> None:
+    """
+    Sets the global shutdown flag to True, instructing all workers to exit.
+    """
+    global _shutdown_requested
+    with _shutdown_lock:
+        _shutdown_requested = True
+
+
+# Global pause event
+pause_event = threading.Event()
+pause_event.clear()  # By default, we start unpaused
+
+def toggle_pause_event() -> None:
+    """
+    Toggles the global pause_event. If it's set, we clear it (unpause).
+    If it's clear, we set it (pause).
+    """
+    if pause_event.is_set():
+        pause_event.clear()
+    else:
+        pause_event.set()
+
+def is_pause_event_set() -> bool:
+    """
+    Returns True if the system is currently paused (pause_event is set).
+    """
+    return pause_event.is_set()

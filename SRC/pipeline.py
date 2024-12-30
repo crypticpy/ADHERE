@@ -1,49 +1,71 @@
 """
-Ticket Processing Pipeline Module
+Ticket Processing Pipeline Module (Updated)
 
-This module implements a sophisticated concurrent processing pipeline for IT service tickets
-with the following key features:
-
-1. Adaptive Concurrency (with CPU-based scaling + random jitter)
-2. Safety Mechanisms:
-   - Circuit Breaker
-   - Token Bucket
-   - Error State Tracking
-3. Data Flow:
-   Raw Tickets → PII Redaction → LLM Processing → Validation → Output Files
-4. Performance Features:
-   - Batch Processing
-   - Thread Pool
-   - Graceful Shutdown
-
-The pipeline is designed to handle large volumes of tickets while maintaining
-system stability and respecting API rate limits.
+Changes in this version:
+1. We removed references to redaction and PII handling (previously used `redact_pii`). 
+2. We relocated the GPT-based sanity check logic to a new file, sanity_check.py.
+3. We import `run_sanity_check` from `sanity_check.py`.
+4. The rest of the concurrency, worker draining, and scaling logic remains the same.
 """
 
 import json
 import logging
 import re
 import time
-import random  # NEW: For jitter in scaling intervals
+import random
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from multiprocessing import Queue as MPQueue
 import psutil
 from typing import Tuple, Optional, List
-
 import threading
+import sys
+from collections import deque
 
+# Project imports
 from config import Config
 from models import TicketSchema, TicketParsedSchema
 from llm_api import retry_call_llm_parse, parse_response
-from utils import redact_pii, fill_missing_fields
+from utils import fill_missing_fields
 from circuit_breaker import CircuitBreaker
 from token_bucket import TokenBucket
 from io_utils import writer_process
-from shared_state import error_state, good_tickets_queue, bad_tickets_queue
+from shared_state import (
+    error_state,
+    good_tickets_queue,
+    bad_tickets_queue,
+    is_shutdown_requested,
+    request_shutdown,
+    is_pause_event_set,
+)
 from openai import APIError, RateLimitError
 
-from main import shutdown_requested
+# Import the new sanity checker
+from sanity_check import run_sanity_check
+
+################################################################################
+# EMA CONFIGURATION & BAD TICKET THRESHOLDS
+################################################################################
+EMA_ALPHA = 0.05         # Smoothing factor for exponential moving average of bad ratio
+BAD_RATIO_WARNING = 0.90 # If bad_ema >= 50%, log a warning
+BAD_RATIO_STOP = 99.0    # If bad_ema >= 80%, we pause pipeline and run a sanity check
+
+################################################################################
+# SENTINELS FOR WORKER CONTROL
+################################################################################
+STOP_SENTINEL = None  # Hard stop sentinel
+
+################################################################################
+# RING BUFFER FOR RECENT BAD TICKETS
+################################################################################
+RECENT_BAD_MAX = 20
+recent_bad_buffer = deque(maxlen=RECENT_BAD_MAX)
+recent_bad_lock = threading.Lock()
+
+################################################################################
+# TICKET TIMEOUT
+################################################################################
+TICKET_TIMEOUT_SECS = 180  # max time to process one ticket (in seconds)
 
 
 def _process_ticket(
@@ -52,80 +74,155 @@ def _process_ticket(
     cfg: Config,
     bucket: TokenBucket,
     circuit_breaker: CircuitBreaker,
-) -> Tuple[Optional[TicketSchema], Optional[str]]:
+    file_q: MPQueue
+) -> Tuple[Optional[TicketSchema], Optional[dict]]:
     """
-    Processes a single ticket through the complete transformation pipeline.
+    Process a single ticket through the transformation pipeline.
 
-    1. JSON Parsing
-    2. Field Normalization
-    3. PII Redaction
-    4. Rate Limiting (Token Bucket)
-    5. Circuit Breaking
-    6. LLM Processing
-    7. Validation
-
-    Args:
-        ticket_json: Raw ticket data as JSON string
-        index: Worker thread identifier
-        cfg: System configuration
-        bucket: Rate limiting token bucket
-        circuit_breaker: Circuit breaker for failure protection
-
+    Steps:
+      1. Parse the incoming JSON ticket data.
+      2. fill_missing_fields to ensure the major fields exist.
+      3. Rate limit check via token bucket.
+      4. Circuit breaker check.
+      5. LLM call for structured parsing, with raw request/response logged.
+      6. Validate final TicketSchema or return a "bad" dict if invalid/bad.
+    
     Returns:
-        (TicketSchema, None) for successful processing
-        (None, error_message) for failed processing
+      (TicketSchema, None) if "good"
+      (None, dict) if "bad", where 'dict' contains raw_ticket plus error info.
     """
-    # Additional debug log for incoming ticket
-    logging.debug("Worker %d received ticket: %s", index, ticket_json[:200])
 
+    # Step 1: Parse the JSON
     try:
         data = json.loads(ticket_json)
     except json.JSONDecodeError as exc:
-        return None, f"Invalid JSON: {exc}"
+        return None, {
+            "raw_ticket": ticket_json,
+            "error": f"Invalid JSON: {exc}"
+        }
 
+    # Step 2: Fill missing fields (no PII redaction anymore)
     filled = fill_missing_fields(data)
-    redacted = redact_pii(filled)
 
-    # Consume a token from the token bucket
+    # Step 3: Rate limiting
     while not bucket.consume(1):
         time.sleep(1)
+        if is_shutdown_requested():
+            return None, {
+                "raw_ticket": ticket_json,
+                "error": "Shutdown requested mid-rate-limit"
+            }
 
+    # Step 4: Circuit breaker check
     if not circuit_breaker.allow_request():
-        return None, "Circuit breaker open (requests not allowed)"
+        return None, {
+            "raw_ticket": ticket_json,
+            "error": "Circuit breaker open (requests not allowed)"
+        }
 
-    raw_str = json.dumps(redacted)
+    # Step 5: Convert to JSON string for LLM call
+    raw_str = json.dumps(filled, ensure_ascii=False, indent=None, separators=(",", ":"))
+
     try:
+        # LLM parse with retry
         response = retry_call_llm_parse(raw_str, cfg)
+
+        # Log raw LLM transaction
+        transaction_data = {
+            "ticket_json": ticket_json,
+            "request_payload": raw_str,
+            "raw_response": str(response),
+        }
+        file_q.put(([transaction_data], cfg.raw_llm_transactions_file))
+
         parsed_resp = parse_response(response)
         if not parsed_resp:
-            return None, "Failed to parse LLM response"
+            return None, {
+                "raw_ticket": ticket_json,
+                "error": "Failed to parse LLM response"
+            }
+
     except (RateLimitError, APIError) as exc:
         circuit_breaker.record_failure()
         error_state.increment()
-        return None, f"API Error (final): {exc}"
+        return None, {
+            "raw_ticket": ticket_json,
+            "error": f"API Error (final): {exc}"
+        }
     except Exception as exc:
+        # Catch-all for unexpected errors
         circuit_breaker.record_failure()
         error_state.increment()
-        return None, f"Worker {index} unexpected final fail: {exc}"
+        return None, {
+            "raw_ticket": ticket_json,
+            "error": f"Worker {index} unexpected final fail: {exc}"
+        }
 
+    # If LLM explicitly says it's "bad"
     if parsed_resp.status.lower() == "bad":
-        return None, parsed_resp.data
+        return None, {
+            "raw_ticket": ticket_json,
+            "error": parsed_resp.data if parsed_resp.data else "LLM says BAD with no reason"
+        }
 
-    if not isinstance(parsed_resp.data, dict):
-        return None, "No parsed data in response"
-
-    try:
-        ticket = TicketSchema(**parsed_resp.data)
-    except Exception:
-        return None, "TicketSchema validation error"
+    # Otherwise "good." Validate TicketSchema
+    if isinstance(parsed_resp.data, TicketSchema):
+        ticket = parsed_resp.data
+    elif isinstance(parsed_resp.data, dict):
+        try:
+            ticket = TicketSchema(**parsed_resp.data)
+        except Exception:
+            return None, {
+                "raw_ticket": ticket_json,
+                "error": "TicketSchema validation error"
+            }
+    else:
+        return None, {
+            "raw_ticket": ticket_json,
+            "error": "No parsed data in LLM response"
+        }
 
     # Check minimal word counts
     instr_words = re.findall(r"\b\w+\b", ticket.instruction or "")
-    outcome_words = re.findall(r"\b\w+\b", ticket.outcome or "")
-    if len(instr_words) < cfg.min_word_count or len(outcome_words) < cfg.min_word_count:
-        return None, "Instruction or outcome too short"
+    resp_words = re.findall(r"\b\w+\b", ticket.response or "")
+    if len(instr_words) < cfg.min_word_count or len(resp_words) < cfg.min_word_count:
+        return None, {
+            "raw_ticket": ticket_json,
+            "error": "Instruction or response too short"
+        }
 
     return ticket, None
+
+
+def worker_task(
+    ticket_data: str,
+    index: int,
+    cfg: Config,
+    bucket: TokenBucket,
+    circuit_breaker: CircuitBreaker,
+    file_q: MPQueue
+) -> Tuple[Optional[TicketSchema], Optional[dict]]:
+    """
+    Wraps _process_ticket with a time-limited approach. 
+    If the ticket can't be processed within TICKET_TIMEOUT_SECS, 
+    we treat it as "bad" to avoid indefinite blocking.
+    """
+    start_time = time.time()
+    result, err_obj = _process_ticket(
+        ticket_json=ticket_data,
+        index=index,
+        cfg=cfg,
+        bucket=bucket,
+        circuit_breaker=circuit_breaker,
+        file_q=file_q
+    )
+    duration = time.time() - start_time
+    if duration > TICKET_TIMEOUT_SECS:
+        return None, {
+            "raw_ticket": ticket_data,
+            "error": f"Ticket timed out after {int(duration)}s"
+        }
+    return result, err_obj
 
 
 def worker(
@@ -135,93 +232,100 @@ def worker(
     bucket: TokenBucket,
     circuit_breaker: CircuitBreaker,
     concurrency_sema: threading.Semaphore,
+    file_q: MPQueue
 ) -> None:
     """
     Worker thread function that processes tickets from a shared queue.
 
-    1. Acquires concurrency permit
-    2. Fetches ticket from queue
-    3. Processes ticket
-    4. Routes result to good or bad queue
-    5. Releases concurrency permit
+    - Respects a global pause_event. If paused, the worker waits until unpaused.
+    - Checks for global shutdown or STOP_SENTINEL.
+    - concurrency_sema controls the actual concurrency (slots available).
 
-    Thread Safety:
-    - Uses semaphore for concurrency control
-    - Queue for thread-safe task distribution
-    - Thread-safe result queues for output
-
-    Args:
-        task_q: Queue containing tickets to process
-        cfg: System configuration
-        index: Worker identifier
-        bucket: Rate limiting token bucket
-        circuit_breaker: Circuit breaker for failure protection
-        concurrency_sema: Semaphore for controlling active workers
-
-    Returns:
-        None. Results are pushed into good_tickets_queue or bad_tickets_queue.
+    We call worker_task(...) to process each ticket with a time limit.
     """
     logging.info("Worker %d started.", index)
+
     while True:
-        concurrency_sema.acquire()
+        if is_shutdown_requested():
+            logging.info("Worker %d sees shutdown_requested => exiting immediately.", index)
+            break
+
+        # If paused, wait in small increments until unpaused or shutdown
+        while is_pause_event_set():
+            if is_shutdown_requested():
+                break
+            time.sleep(0.2)
+        if is_shutdown_requested():
+            break
+
+        # Acquire concurrency
+        acquired = concurrency_sema.acquire(timeout=0.5)
+        if not acquired:
+            # Could not acquire in 0.5s, re-check shutdown
+            if is_shutdown_requested():
+                break
+            continue
+
         try:
+            # Try to get a ticket
             try:
-                ticket_data = task_q.get(timeout=1)
+                ticket_data = task_q.get(timeout=0.2)
             except Empty:
-                break
-            if ticket_data is None:
+                concurrency_sema.release()
+                continue
+
+            if ticket_data is STOP_SENTINEL:
                 task_q.task_done()
+                concurrency_sema.release()
+                logging.info("Worker %d got STOP_SENTINEL => exiting", index)
                 break
 
-            result, err = _process_ticket(
-                ticket_data, index, cfg, bucket, circuit_breaker
-            )
-            if result:
-                good_tickets_queue.put(result)
-            elif err:
-                bad_tickets_queue.put(err)
-            task_q.task_done()
-        finally:
-            concurrency_sema.release()
+            try:
+                result, err_obj = worker_task(
+                    ticket_data,
+                    index,
+                    cfg,
+                    bucket,
+                    circuit_breaker,
+                    file_q
+                )
+                if result:
+                    good_tickets_queue.put(result)
+                elif err_obj:
+                    bad_tickets_queue.put(err_obj)
+                    with recent_bad_lock:
+                        recent_bad_buffer.append(err_obj)
+            finally:
+                task_q.task_done()
+                concurrency_sema.release()
+
+        except Exception as e:
+            logging.error("Worker %d encountered unexpected error: %s", index, e, exc_info=True)
+            break
+
+    logging.info("Worker %d exiting.", index)
 
 
-def maybe_warmup(
-    num_tickets: int, cfg: Config, concurrency_sema: threading.Semaphore
+def wait_for_workers_to_drain(
+    task_q: Queue,
+    concurrency_sema: threading.Semaphore,
+    active_workers: int
 ) -> None:
     """
-    Implements adaptive warm-up strategy based on workload size.
+    Blocks until:
+      1) The task queue is empty
+      2) All concurrency slots are free (i.e., no tickets in flight).
 
-    Warm-up Strategies:
-    1. Simple Warm-up (< 10,000 tickets): sets concurrency to cfg.initial_workers
-    2. Advanced Warm-up (>= 10,000 tickets):
-       - Start with 2 workers
-       - Gradually ramp to cfg.initial_workers over ~120s
-
-    Args:
-        num_tickets: Total number of tickets to process
-        cfg: System configuration
-        concurrency_sema: Semaphore controlling worker count
+    :param task_q: The queue of tasks.
+    :param concurrency_sema: The semaphore controlling concurrency.
+    :param active_workers: Current concurrency setting, 
+                          so we know how many slots should be free for "idle".
     """
-    if num_tickets < 10000:
-        needed = cfg.initial_workers - concurrency_sema._value
-        if needed > 0:
-            concurrency_sema.release(needed)
-        logging.info("Simple warmup set concurrency to %d", cfg.initial_workers)
-    else:
-        current = concurrency_sema._value
-        if current > 2:
-            for _ in range(current - 2):
-                concurrency_sema.acquire()
-        else:
-            concurrency_sema.release(max(0, 2 - current))
-
-        steps = cfg.initial_workers - 2
-        if steps > 0:
-            interval = 120 / steps
-            logging.info("Advanced warmup from 2 to %d over ~120s", cfg.initial_workers)
-            for _ in range(steps):
-                time.sleep(interval)
-                concurrency_sema.release(1)
+    while True:
+        if task_q.empty():
+            if concurrency_sema._value == active_workers:
+                break
+        time.sleep(0.2)
 
 
 def process_tickets_with_scaling(
@@ -232,126 +336,168 @@ def process_tickets_with_scaling(
     bucket: TokenBucket,
 ) -> None:
     """
-    Main orchestrator for the ticket processing pipeline with adaptive scaling and random jitter.
+    Main orchestrator for ticket processing, including:
+      - concurrency scaling
+      - circuit breaker & error threshold
+      - exponential moving average for bad tickets
+      - GPT-based sanity check if too many tickets are flagged "bad"
+      - pause/resume logic
+      - graceful stop
 
-    System Architecture:
-        Input Queue → Workers → Result Queue → File Writer
-                       |          |
-                (Rate Limit) (Circuit Breaker)
-
-    Features:
-    1. Concurrency Management with CPU-based scaling + random jitter
-    2. Safety Mechanisms (circuit breaker, token bucket, error tracking)
-    3. I/O Efficiency (batch processing of results)
-    4. Monitoring (progress bar, logging)
-
-    Args:
-        tickets: List of raw ticket JSON strings
-        cfg: System configuration
-        file_q: Queue for file writing operations
-        circuit_breaker: Circuit breaker for failure protection
-        bucket: Token bucket for rate limiting
+    :param tickets: List of raw JSON strings representing the tickets.
+    :param cfg: Configuration object.
+    :param file_q: Queue for writer process.
+    :param circuit_breaker: Circuit breaker instance.
+    :param bucket: TokenBucket instance.
     """
-    logging.info("Starting ticket processing with adaptive concurrency.")
+    logging.info("Starting ticket processing with adaptive concurrency for %d tickets.", len(tickets))
+
     task_q = Queue()
     for tk in tickets:
         task_q.put(tk)
 
-    executor = ThreadPoolExecutor(max_workers=cfg.max_workers)
-    concurrency_sema = threading.Semaphore(1)  # Start small, ramp up in warmup
+    max_possible_workers = cfg.max_workers
+    from concurrent.futures import ThreadPoolExecutor
+    executor = ThreadPoolExecutor(max_workers=max_possible_workers)
 
-    for i in range(cfg.max_workers):
+    concurrency_sema = threading.Semaphore(0)  # start concurrency at 0, ramp up
+
+    # Launch the worker threads
+    for i in range(max_possible_workers):
         executor.submit(
-            worker, task_q, cfg, i, bucket, circuit_breaker, concurrency_sema
+            worker,
+            task_q,
+            cfg,
+            i,
+            bucket,
+            circuit_breaker,
+            concurrency_sema,
+            file_q
         )
 
     total = len(tickets)
     processed_count = 0
+    good_count = 0
+    bad_count = 0
+    bad_ema = 0.0  # Exponential moving average for "bad" ratio
 
-    # Initial warmup
-    maybe_warmup(total, cfg, concurrency_sema)
+    # Start concurrency at cfg.initial_workers
+    current_workers = 0
+
+    def warmup_workers():
+        nonlocal current_workers
+        needed = cfg.initial_workers - current_workers
+        if needed > 0:
+            for _ in range(needed):
+                concurrency_sema.release()
+            current_workers += needed
+            time.sleep(0.5)
+
+    warmup_workers()
 
     from tqdm import tqdm
-
     pbar = tqdm(total=total, desc="Processing Tickets")
-
     last_scale_time = time.monotonic()
-    cooldown_active = False
-    current_workers = cfg.initial_workers
-
-    # Ensure concurrency matches initial_workers after warmup
-    delta = concurrency_sema._value - current_workers
-    if delta > 0:
-        for _ in range(delta):
-            concurrency_sema.acquire()
-    elif delta < 0:
-        concurrency_sema.release(-delta)
-
     last_log_time = time.monotonic()
-
-    up_threshold = cfg.cpu_scale_up_threshold
-    down_threshold = cfg.cpu_scale_down_threshold
+    force_stop = False
 
     while True:
-        if shutdown_requested:
-            logging.warning("Graceful shutdown triggered.")
-            break
+        if is_shutdown_requested():
+            logging.warning("Main loop sees global shutdown => force_stop.")
+            force_stop = True
 
         # Drain good tickets
-        if good_tickets_queue.qsize() >= cfg.batch_size:
-            batch = []
-            while not good_tickets_queue.empty() and len(batch) < cfg.batch_size:
-                batch.append(good_tickets_queue.get())
-            file_q.put((batch, cfg.good_tickets_file))
-            processed_count += len(batch)
-            pbar.update(len(batch))
+        while not good_tickets_queue.empty():
+            good_batch = []
+            while not good_tickets_queue.empty() and len(good_batch) < cfg.batch_size:
+                good_batch.append(good_tickets_queue.get())
+            if good_batch:
+                processed_count += len(good_batch)
+                good_count += len(good_batch)
+                pbar.update(len(good_batch))
+                file_q.put((good_batch, cfg.good_tickets_file))
+                # bad_ema update with 0.0 for each good
+                for _ in good_batch:
+                    bad_ema = EMA_ALPHA * 0.0 + (1 - EMA_ALPHA) * bad_ema
 
         # Drain bad tickets
-        if bad_tickets_queue.qsize() >= cfg.batch_size:
-            batch = []
-            while not bad_tickets_queue.empty() and len(batch) < cfg.batch_size:
-                batch.append(bad_tickets_queue.get())
-            file_q.put((batch, cfg.bad_tickets_file))
-            processed_count += len(batch)
-            pbar.update(len(batch))
+        while not bad_tickets_queue.empty():
+            bad_batch = []
+            while not bad_tickets_queue.empty() and len(bad_batch) < cfg.batch_size:
+                bad_batch.append(bad_tickets_queue.get())
+            if bad_batch:
+                processed_count += len(bad_batch)
+                bad_count += len(bad_batch)
+                pbar.update(len(bad_batch))
+                file_q.put((bad_batch, cfg.bad_tickets_file))
+                # bad_ema update with 1.0 for each bad
+                for _ in bad_batch:
+                    bad_ema = EMA_ALPHA * 1.0 + (1 - EMA_ALPHA) * bad_ema
 
-        # Check error threshold => cooldown
-        if error_state.error_count >= cfg.error_threshold and not cooldown_active:
-            cooldown_active = True
-            logging.warning("Too many errors. Cooling down to 1 worker.")
-            if current_workers > 1:
-                for _ in range(current_workers - 1):
+        # Check thresholds
+        if bad_ema >= BAD_RATIO_WARNING and not force_stop:
+            logging.warning(
+                "High bad ticket EMA=%.2f. Good=%d, Bad=%d so far.",
+                bad_ema,
+                good_count,
+                bad_count
+            )
+
+        if bad_ema >= BAD_RATIO_STOP and not force_stop:
+            logging.error(
+                "Bad ticket EMA=%.2f >= %.2f, pausing to run sanity check.",
+                bad_ema,
+                BAD_RATIO_STOP
+            )
+            logging.warning("Waiting for workers to drain all tasks before sanity check...")
+            wait_for_workers_to_drain(task_q, concurrency_sema, current_workers)
+
+            # Gather a copy of recent bad tickets for sanity check
+            with recent_bad_lock:
+                samples = list(recent_bad_buffer)
+
+            decision = run_sanity_check(cfg, samples)
+            if decision == "stop":
+                logging.error("GPT-4 sanity check says STOP. Forcing stop.")
+                force_stop = True
+            else:
+                logging.warning("GPT-4 sanity check says CONTINUE. Resetting thresholds.")
+                bad_ema = 0.0
+                error_state.reset()
+                circuit_breaker.reset()
+                # Optionally reduce concurrency
+                new_count = max(1, current_workers // 2)
+                to_reduce = current_workers - new_count
+                for _ in range(to_reduce):
                     concurrency_sema.acquire()
-                current_workers = 1
+                current_workers = new_count
+                # Then re-warm
+                warmup_workers()
+                logging.warning("Resumed pipeline after sanity check with concurrency=%d", current_workers)
 
-            error_state.reset()
-            time.sleep(cfg.cool_down_time)
-            circuit_breaker.reset()
-            cooldown_active = False
+        if force_stop:
+            logging.warning("Forcing stop. Inserting STOP_SENTINEL for all workers.")
+            for _ in range(max_possible_workers):
+                task_q.put(STOP_SENTINEL)
+            break
 
-            concurrency_sema.release(cfg.initial_workers - current_workers)
-            current_workers = cfg.initial_workers
-            last_scale_time = time.monotonic()
-
-        # Periodic adaptive scaling with hysteresis + random jitter
+        # Adaptive scaling (CPU-based)
         now = time.monotonic()
-        if not cooldown_active and (now - last_scale_time) >= cfg.scale_interval:
+        if not force_stop and (now - last_scale_time) >= cfg.scale_interval:
             cpu_usage = psutil.cpu_percent() if cfg.enable_resource_monitoring else 0
-
-            # Introduce a small random jitter (0 - 5 seconds) to avoid thrashing
-            time.sleep(random.uniform(0, 5))
-
-            if cpu_usage < up_threshold and current_workers < cfg.max_workers:
+            time.sleep(random.uniform(0, 2))
+            if cpu_usage < cfg.cpu_scale_up_threshold and current_workers < cfg.max_workers:
                 new_count = min(current_workers + cfg.scale_step, cfg.max_workers)
-                concurrency_sema.release(new_count - current_workers)
+                for _ in range(new_count - current_workers):
+                    concurrency_sema.release()
                 logging.info(
                     "Scaling up from %d to %d (cpu=%.1f%%)",
                     current_workers,
                     new_count,
-                    cpu_usage,
+                    cpu_usage
                 )
                 current_workers = new_count
-            elif cpu_usage > down_threshold and current_workers > 2:
+            elif cpu_usage > cfg.cpu_scale_down_threshold and current_workers > 2:
                 to_reduce = min(cfg.scale_step, current_workers - 2)
                 for _ in range(to_reduce):
                     concurrency_sema.acquire()
@@ -360,38 +506,33 @@ def process_tickets_with_scaling(
                     "Scaling down from %d to %d (cpu=%.1f%%)",
                     current_workers,
                     new_count,
-                    cpu_usage,
+                    cpu_usage
                 )
                 current_workers = new_count
 
             last_scale_time = time.monotonic()
 
-        # Periodically log progress
+        # Periodic progress logging
         if (time.monotonic() - last_log_time) > 30:
             logging.info(
-                "Progress: %d/%d processed. Current concurrency=%d",
+                "Progress: %d/%d processed. Good=%d, Bad=%d, Concurrency=%d, BadEMA=%.2f",
                 processed_count,
                 total,
+                good_count,
+                bad_count,
                 current_workers,
+                bad_ema
             )
             last_log_time = time.monotonic()
 
-        # Check if queue is empty and no tasks remain
-        if task_q.empty():
-            # Attempt final flush
-            if good_tickets_queue.qsize() == 0 and bad_tickets_queue.qsize() == 0:
-                time.sleep(1)
-                if (
-                    task_q.empty()
-                    and good_tickets_queue.empty()
-                    and bad_tickets_queue.empty()
-                ):
-                    break
-
+        # Are we done?
+        if task_q.empty() and good_tickets_queue.empty() and bad_tickets_queue.empty():
+            if concurrency_sema._value == current_workers:
+                break
         time.sleep(0.2)
 
     pbar.close()
-    executor.shutdown(wait=True)
+    executor.shutdown(wait=True, cancel_futures=True)
 
     # Final flush
     final_good = []
@@ -406,4 +547,10 @@ def process_tickets_with_scaling(
     if final_bad:
         file_q.put((final_bad, cfg.bad_tickets_file))
 
-    file_q.put(None)  # Signal writer to stop
+    logging.info(
+        "Done processing. Good=%d, Bad=%d, total processed=%d, final badEMA=%.2f",
+        good_count,
+        bad_count,
+        processed_count,
+        bad_ema
+    )
