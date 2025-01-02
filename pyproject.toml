@@ -1,0 +1,16 @@
+[project]
+name = "adhere"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "chardet>=5.2.0",
+    "openai>=1.58.1",
+    "pandas>=2.2.3",
+    "presidio-analyzer>=2.2.356",
+    "presidio-anonymizer>=2.2.356",
+    "psutil>=6.1.1",
+    "tenacity>=9.0.0",
+    "tqdm>=4.67.1",
+]
